@@ -87,6 +87,10 @@ public interface SelectClause2<in P, out Q> {
     public fun <R> registerSelectClause2(select: SelectInstance<R>, param: P, block: suspend (Q) -> R)
 }
 
+@JvmField
+@SharedImmutable
+internal val SELECT_STARTED: Any = Symbol("SELECT_STARTED")
+
 /**
  * Internal representation of select instance. This instance is called _selected_ when
  * the clause to execute is already picked.
@@ -101,12 +105,21 @@ public interface SelectInstance<in R> {
     public val isSelected: Boolean
 
     /**
-     * Tries to select this instance.
+     * Tries to select this instance. Returns `true` on success.
      */
-    public fun trySelect(idempotent: Any?): Boolean
+    public fun trySelect(): Boolean
+
+    /**
+     * Tries to select this instance. Returns:
+     * * [SELECT_STARTED] on success,
+     * * [RETRY_ATOMIC] on deadlock (needs retry, it is only possible when [idempotent] is not `null`)
+     * * `null` on failure to select (already selected).
+     */
+    public fun trySelectIdempotent(idempotent: Any?): Any?
 
     /**
      * Performs action atomically with [trySelect].
+     * May return [RETRY_ATOMIC], caller shall retry with **fresh instance of desc**.
      */
     public fun performAtomicTrySelect(desc: AtomicDesc): Any?
 
@@ -189,11 +202,15 @@ private val UNDECIDED: Any = Symbol("UNDECIDED")
 @SharedImmutable
 private val RESUMED: Any = Symbol("RESUMED")
 
+// Global counter of all atomic select operations for their deadlock resolution
+private val selectOpSequenceNumber = atomic(1L)
+
 @PublishedApi
 internal class SelectBuilderImpl<in R>(
     private val uCont: Continuation<R> // unintercepted delegate continuation
 ) : LockFreeLinkedListHead(), SelectBuilder<R>,
-    SelectInstance<R>, Continuation<R>, CoroutineStackFrame {
+    SelectInstance<R>, Continuation<R>, CoroutineStackFrame
+{
     override val callerFrame: CoroutineStackFrame?
         get() = uCont as? CoroutineStackFrame
 
@@ -234,9 +251,7 @@ internal class SelectBuilderImpl<in R>(
         _result.loop { result ->
             when {
                 result === UNDECIDED -> if (_result.compareAndSet(UNDECIDED, value())) return
-                result === COROUTINE_SUSPENDED -> if (_result.compareAndSet(COROUTINE_SUSPENDED,
-                        RESUMED
-                    )) {
+                result === COROUTINE_SUSPENDED -> if (_result.compareAndSet(COROUTINE_SUSPENDED, RESUMED)) {
                     block()
                     return
                 }
@@ -290,29 +305,22 @@ internal class SelectBuilderImpl<in R>(
     private inner class SelectOnCancelling(job: Job) : JobCancellingNode<Job>(job) {
         // Note: may be invoked multiple times, but only the first trySelect succeeds anyway
         override fun invoke(cause: Throwable?) {
-            if (trySelect(null))
+            if (trySelect())
                 resumeSelectCancellableWithException(job.getCancellationException())
         }
         override fun toString(): String = "SelectOnCancelling[${this@SelectBuilderImpl}]"
     }
 
-    private val state: Any? get() {
-        _state.loop { state ->
-            if (state !is OpDescriptor) return state
-            state.perform(this)
-        }
-    }
-
     @PublishedApi
     internal fun handleBuilderException(e: Throwable) {
-        if (trySelect(null)) {
+        if (trySelect()) {
             resumeWithException(e)
         } else if (e !is CancellationException) {
             /*
              * Cannot handle this exception -- builder was already resumed with a different exception,
              * so treat it as "unhandled exception". But only if  it is not the completion reason
              *  and it's not the cancellation. Otherwise, in the face of structured concurrency
-             * the same exception will be reported to theglobal exception handler.
+             * the same exception will be reported to the global exception handler.
              */
             val result = getResult()
             if (result !is CompletedExceptionally || unwrap(result.cause) !== unwrap(e)) {
@@ -321,7 +329,13 @@ internal class SelectBuilderImpl<in R>(
         }
     }
 
-    override val isSelected: Boolean get() = state !== this
+    override val isSelected: Boolean get() = _state.loop { state ->
+        when {
+            state === this -> return false
+            state is OpDescriptor -> state.perform(this) // help
+            else -> return true // already selected
+        }
+    }
 
     override fun disposeOnSelect(handle: DisposableHandle) {
         val node = DisposeNode(handle)
@@ -342,32 +356,78 @@ internal class SelectBuilderImpl<in R>(
         }
     }
 
-    // it is just like start(), but support idempotent start
-    override fun trySelect(idempotent: Any?): Boolean {
+    override fun trySelect(): Boolean = trySelectIdempotent(null) === SELECT_STARTED
+
+    // it is just like plain trySelect, but support idempotent start
+    override fun trySelectIdempotent(idempotent: Any?): Any? {
         assert { idempotent !is OpDescriptor } // "cannot use OpDescriptor as idempotent marker"
-        while (true) { // lock-free loop on state
-            val state = this.state
+        _state.loop { state -> // lock-free loop on state
             when {
-                state === this -> {
-                    if (_state.compareAndSet(this, idempotent)) {
-                        doAfterSelect()
-                        return true
+                // Found initial state (not selected yet) -- try to make it selected
+                state === this -> if (_state.compareAndSet(this, idempotent)) {
+                    doAfterSelect()
+                    return SELECT_STARTED
+                }
+                // Found descriptor of another atomic operation?
+                state is OpDescriptor -> {
+                    // Found descriptor of this select operation while working in the context of other select operation
+                    if (state is AtomicSelectOp<*> && idempotent is AtomicDesc) {
+                        assert { state.impl === this } // this state can only be in process of selection on this instance
+                        val otherOp = idempotent.atomicOp
+                        when {
+                            // It is the same select instance
+                            otherOp is AtomicSelectOp<*> && otherOp.impl === this -> {
+                                /*
+                                 * We cannot do state.perform(this) here and "help" it since it is the same
+                                 * select and we'll get StackOverflowError.
+                                 * See https://github.com/Kotlin/kotlinx.coroutines/issues/1411
+                                 * We cannot support this because select { ... } is an expression and its clauses
+                                 * have a result that shall be returned from the select.
+                                 */
+                                error("Cannot use matching select clauses on the same object")
+                            }
+                            // The other select (that is trying to proceed) had started earlier
+                            otherOp.isEarlierThan(state) -> {
+                                /**
+                                 * Abort to prevent deadlock by returning a failure to it.
+                                 * See https://github.com/Kotlin/kotlinx.coroutines/issues/504
+                                 * The other select operation will receive a failure and will restart itself with a
+                                 * larger sequence number. This guarantees obstruction-freedom of this algorithm.
+                                 */
+                                return RETRY_ATOMIC
+                            }
+                        }
                     }
+                    // Otherwise (not a special descriptor)
+                    state.perform(this) // help it
                 }
                 // otherwise -- already selected
-                idempotent == null -> return false // already selected
-                state === idempotent -> return true // was selected with this marker
-                else -> return false
+                idempotent == null -> return null // already selected
+                state === idempotent -> return SELECT_STARTED // was selected with this marker
+                else -> return null // selected with different marker
             }
         }
     }
 
     override fun performAtomicTrySelect(desc: AtomicDesc): Any? =
-        AtomicSelectOp(desc).perform(null)
+        AtomicSelectOp(this, desc).perform(null)
 
-    private inner class AtomicSelectOp(
+    override fun toString(): String {
+        val state = _state.value
+        return "SelectInstance(state=${if (state === this) "this" else state.toString()}, result=${_result.value})"
+    }
+
+    private class AtomicSelectOp<R>(
+        @JvmField val impl: SelectBuilderImpl<R>,
         @JvmField val desc: AtomicDesc
     ) : AtomicOp<Any?>() {
+        // all select operations are totally ordered by their creating time using selectOpSequenceNumber
+        override val opSequence = selectOpSequenceNumber.getAndIncrement()
+
+        init {
+            desc.atomicOp = this
+        }
+
         override fun prepare(affected: Any?): Any? {
             // only originator of operation makes preparation move of installing descriptor into this selector's state
             // helpers should never do it, or risk ruining progress when they come late
@@ -375,7 +435,13 @@ internal class SelectBuilderImpl<in R>(
                 // we are originator (affected reference is not null if helping)
                 prepareIfNotSelected()?.let { return it }
             }
-            return desc.prepare(this)
+            try {
+                return desc.prepare(this)
+            } catch (e: Throwable) {
+                // undo prepareIfNotSelected on crash (for example if IllegalStateException is thrown)
+                if (affected == null) undoPrepare()
+                throw e
+            }
         }
 
         override fun complete(affected: Any?, failure: Any?) {
@@ -383,13 +449,13 @@ internal class SelectBuilderImpl<in R>(
             desc.complete(this, failure)
         }
 
-        fun prepareIfNotSelected(): Any? {
-            _state.loop { state ->
+        private fun prepareIfNotSelected(): Any? {
+            impl._state.loop { state ->
                 when {
-                    state === this@AtomicSelectOp -> return null // already in progress
-                    state is OpDescriptor -> state.perform(this@SelectBuilderImpl) // help
-                    state === this@SelectBuilderImpl -> {
-                        if (_state.compareAndSet(this@SelectBuilderImpl, this@AtomicSelectOp))
+                    state === this -> return null // already in progress
+                    state is OpDescriptor -> state.perform(impl) // help
+                    state === impl -> {
+                        if (impl._state.compareAndSet(impl, this))
                             return null // success
                     }
                     else -> return ALREADY_SELECTED
@@ -397,14 +463,21 @@ internal class SelectBuilderImpl<in R>(
             }
         }
 
+        // reverts the change done by prepareIfNotSelected
+        private fun undoPrepare() {
+            impl._state.compareAndSet(this, impl)
+        }
+
         private fun completeSelect(failure: Any?) {
             val selectSuccess = failure == null
-            val update = if (selectSuccess) null else this@SelectBuilderImpl
-            if (_state.compareAndSet(this@AtomicSelectOp, update)) {
+            val update = if (selectSuccess) null else impl
+            if (impl._state.compareAndSet(this, update)) {
                 if (selectSuccess)
-                    doAfterSelect()
+                    impl.doAfterSelect()
             }
         }
+
+        override fun toString(): String = "AtomicSelectOp(sequence=$opSequence)"
     }
 
     override fun SelectClause0.invoke(block: suspend () -> R) {
@@ -421,14 +494,14 @@ internal class SelectBuilderImpl<in R>(
 
     override fun onTimeout(timeMillis: Long, block: suspend () -> R) {
         if (timeMillis <= 0L) {
-            if (trySelect(null))
+            if (trySelect())
                 block.startCoroutineUnintercepted(completion)
             return
         }
         val action = Runnable {
             // todo: we could have replaced startCoroutine with startCoroutineUndispatched
             // But we need a way to know that Delay.invokeOnTimeout had used the right thread
-            if (trySelect(null))
+            if (trySelect())
                 block.startCoroutineCancellable(completion) // shall be cancellable while waits for dispatch
         }
         disposeOnSelect(context.delay.invokeOnTimeout(timeMillis, action))
